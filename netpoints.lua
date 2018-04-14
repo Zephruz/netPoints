@@ -98,8 +98,7 @@ end
 ---------------------
 --> netPoint:DecompressNetData()
 -- 	-> Decompresses received net data.
---	-> Must be used within a net.Receive callback and data must be sent with netPoint:SendCompressedNetMessage(...)
---		-> You can also use netPoint:CompressTableToSend(...) to compress data and send it yourself
+--	-> Must be used within a net.Receive callback and data must be compressed with netPoint:CompressTableToSend()
 ---------------------
 function netPoint:DecompressNetData()
 	local dataBInt = net.ReadUInt(32)
@@ -222,8 +221,18 @@ if (CLIENT) then
 			})
 
 			-- Run receive results callback
-			if (data.receiveResults) then
-				data.receiveResults(dataRes)
+			local recRes = data.receiveResults
+
+			if (istable(recRes)) then
+				for k,v in pairs(dataRes) do
+					local resResVal = recRes[k]
+
+					if (isfunction(resResVal)) then
+						resResVal(v)
+					end
+				end
+			elseif (isfunction(recRes)) then
+				recRes(dataRes)
 			end
 
 			netPoint:RemoveRequest(nmReqID)	-- Close the request
