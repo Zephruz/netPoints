@@ -98,7 +98,8 @@ end
 ---------------------
 --> netPoint:DecompressNetData()
 -- 	-> Decompresses received net data.
---	-> Must be used within a net.Receive callback and data must be compressed with netPoint:CompressTableToSend()
+--	-> Must be used within a net.Receive callback and data must be sent with netPoint:SendCompressedNetMessage(...)
+--		-> You can also use netPoint:CompressTableToSend(...) to compress data and send it yourself
 ---------------------
 function netPoint:DecompressNetData()
 	local dataBInt = net.ReadUInt(32)
