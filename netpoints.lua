@@ -1,5 +1,5 @@
 --[[
-	netPoint - V1
+	netPoint - V1.2
 
 	-- What does this do?
 		* Provides a means of data transferring/querying between the client and server
@@ -16,17 +16,69 @@ netPoint.debug = false 		-- Enables debug messages
 
 netPoint.reqTimeout = 5  	-- How long before a request times out and retries
 
-netPoint.reqRetryAmt = 3	-- How many times a request is retried before closed
+netPoint.reqRetryAmt = 2	-- How many times a request is retried before closed
 
-netPoint.maxRequests = 100 -- Maximum amount of requests within 5 seconds [before a user gets blocked from sending more until timeout]
+netPoint.maxRequests = 50 	-- Maximum amount of requests within (netPoint.reqTimeout) seconds [before a user gets blocked from sending more until timeout]
 
 --[[DON'T EDIT BELOW HERE]]
 netPoint._cache = (netPoint._cache or {})
 netPoint._endPoints = (netPoint._endPoints or {})
+netPoint._payloads = (netPoint._payloads or {})
+netPoint._payloadBuffer = (netPoint._payloadBuffer or {})
 netPoint._receivers = {
 	["cl"] = "NP.RC",
 	["sv"] = "NP.RS",
+	["payload"] = "NP.PAYLOAD",
 }
+
+local function splitTable(inTbl,at)
+	if !(istable(inTbl)) then return {} end
+
+	inTbl = table.Copy(inTbl)
+
+	local outTbl, keyStash = {}, {}
+	local x, split = table.Count(inTbl), at
+	local fl = math.ceil(x/split)
+	
+	-- [[Chop it up]]
+	for i=1,fl do outTbl[i] = {} end
+
+	-- [[Stash any non-numerical (or large) index's into a keyStash for later re-indexing]]
+	for k,v in pairs(inTbl) do
+		if (!isnumber(k) or k>#inTbl) then
+			local data = v -- Localize data
+			inTbl[k] = nil -- Nil string index
+
+			local newPos = #inTbl+1 -- Get the new position
+			inTbl[newPos] = data -- Add to a numerical index in the original table
+			keyStash[newPos] = k -- Save the string key in the keystash at its number index
+		end
+	end
+
+	-- [[Place into new table]]
+	for k,v in pairs(inTbl) do
+		local indx = math.ceil(k/split)
+
+		if !(outTbl[indx]) then outTbl[indx] = {} end
+
+		outTbl[indx][(keyStash[k] || k)] = (inTbl[k] or false)
+	end
+
+	return outTbl
+end
+
+local function rebuildSplitTable(inTbl)
+	local outTbl = {}
+
+	for i=1,#inTbl do
+		for k,v in pairs(inTbl[i]) do
+			outTbl[k] = v
+		end
+	end
+
+	return outTbl
+end
+
 
 --[[----------
 	SHARED
@@ -81,6 +133,50 @@ function netPoint:CreateEndPoint(reqEP, data)
 end
 
 ---------------------
+--> netPoint:SendPayload(id, ply, tbl)
+-- 	-> Sends a payload
+--  -> ARGUMENTS
+	-- * id (STRING) - ID of the payload
+	-- * ply (ENTITY) - Player to send to (can be a table of players)
+	-- * tbl (STRING) - Table to send
+	-- * pLoadSize (INTEGER) - Maximum size of each payload fragment; defaults to 1
+	-- * ... (VARARG) - Any extra information you want to pass; must be a string or integer
+---------------------
+function netPoint:SendPayload(id, ply, tbl, pLoadSize, ...)
+	local compTbl, size = self:CompressTableToSend(tbl)
+
+	-- Split table
+	pLoadSize = (pLoadSize or 1)
+	local splitTbl = splitTable(tbl, pLoadSize) -- Split the table so we can send it in payloads
+	local pLoadRandID = math.random(1,1000000000) -- Generate a random payload ID
+	local pLoadSize = table.Count(splitTbl)
+	local extraHeader = (von && von.serialize({...}) || util.TableToJSON({...})) -- Serialize the extraHeader to maintain its type integrity
+
+	for k,v in pairs(splitTbl) do
+		self:SendCompressedNetMessage(self._receivers["payload"], ply, v,
+		function(compData, compBInt)
+			net.WriteString(id .. "," .. pLoadRandID .. "," .. pLoadSize .. "," .. k .. "," .. util.CRC(compData))
+
+			if (extraHeader) then
+				net.WriteString(extraHeader)
+			end
+		end)
+	end
+end
+
+---------------------
+--> netPoint:ReceivePayload(id, tbl, ply)
+-- 	-> Receives payload
+--  -> ARGUMENTS
+	-- * id (STRING) - Payload to receive
+	-- * onReceive (FUNCTION) - Receive callback
+---------------------
+function netPoint:ReceivePayload(id, onReceive)
+	self._payloadBuffer[id] = (self._payloadBuffer[id] or {})
+	self._payloads[id] = onReceive
+end
+
+---------------------
 --> netPoint:CompressTableToSend(tbl)
 -- 	-> Compresses a table and returns the compressed data and the length of the data
 --  -> ARGUMENTS
@@ -102,8 +198,8 @@ end
 ---------------------
 function netPoint:DecompressNetData()
 	local dataBInt = net.ReadUInt(32)
-	local data = net.ReadData(dataBInt)
-	data = (data && util.Decompress(data))
+	local compData = net.ReadData(dataBInt)
+	local data = (compData && util.Decompress(compData))
 	data = (data && von && von.deserialize(data) || data && util.JSONToTable(data) || nil)
 
 	if (data["_netPoint"]) then
@@ -112,7 +208,7 @@ function netPoint:DecompressNetData()
 		data["_netPoint"] = nil
 	end
 
-	return data, dataBInt
+	return data, dataBInt, compData
 end
 
 ---------------------
@@ -128,9 +224,12 @@ function netPoint:SendCompressedNetMessage(nwuid, receiver, data, cbWrite)
 
 	if (compData && compBInt) then
 		net.Start(nwuid)
-			net.WriteUInt(compBInt, 32)
-			net.WriteData(compData, compBInt)
-			if (isfunction(cbWrite)) then cbWrite() end
+
+		net.WriteUInt(compBInt, 32)
+		net.WriteData(compData, compBInt)
+
+		if (isfunction(cbWrite)) then cbWrite(compData, compBInt) end
+		
 		if (receiver == "SERVER") then
 			net.SendToServer()
 		else
@@ -145,6 +244,7 @@ end
 if (SERVER) then
 	util.AddNetworkString(netPoint._receivers["sv"])
 	util.AddNetworkString(netPoint._receivers["cl"])
+	util.AddNetworkString(netPoint._receivers["payload"])
 
 	--[[Used to receive netpoint requests]]
 	net.Receive(netPoint._receivers["sv"],
@@ -171,25 +271,24 @@ if (SERVER) then
 		local reqIDRec = net.ReadString()
 
 		local epData = netPoint:GetEndPoint(reqEPRec)
-
-		if !(epData) then return false end	-- This should not happen; this message got sent to the wrong endpoint or this user is attempting an exploit
-		if (!reqData or reqData["_CLERR"] or !reqEPRec or !reqIDRec) then return false end
+		
+		if (!epData or !reqData or reqData["_CLERR"] or !reqEPRec or !reqIDRec) then return false end
 
 		for k,v in pairs(epData) do
 			local val = reqData[k]
 
 			if (val) then
-				retData[k] = (v(ply,val) or {})
+				retData[k] = v(ply,val)
 			end
 		end
 
 		if !(retData) then return false end
-
+		
 		netPoint:SendCompressedNetMessage(netPoint._receivers["cl"], ply, retData,
-			function()
-				net.WriteString(reqEPRec)
-				net.WriteString(reqIDRec)
-			end)
+		function()
+			net.WriteString(reqEPRec)
+			net.WriteString(reqIDRec)
+		end)
 	end)
 end
 
@@ -199,7 +298,7 @@ end
 if (CLIENT) then
 	netPoint._openRequests = (netPoint._openRequests or {})
 
-	--[[Used to receive netpoint messages]]
+	--[[Receive netpoint messages]]
 	net.Receive(netPoint._receivers["cl"],
 	function(len)
 		local dataRes, dataBInt = netPoint:DecompressNetData()
@@ -238,6 +337,36 @@ if (CLIENT) then
 			netPoint:RemoveRequest(nmReqID)	-- Close the request
 
 			netPoint:DebugMessage("RESULT RECEIVED: " .. nmReqID .. " (SIZE: " .. (dataBInt || "NIL") .. " bytes)" .. " - " .. os.date("%H:%M:%S - %m/%d/%Y", os.time()))
+		end
+	end)
+
+	--[[Receive payload messages]]
+	net.Receive(netPoint._receivers["payload"],
+	function(len)
+		local data, dataBInt, compData = netPoint:DecompressNetData()
+		local pLoadHeader = string.Explode(",", net.ReadString())
+		local pLoadExtraHeader = net.ReadString()
+		pLoadExtraHeader = (von && von.deserialize(pLoadExtraHeader) || util.JSONToTable(pLoadExtraHeader))
+		pLoadExtraHeader = (istable(pLoadExtraHeader) && unpack(pLoadExtraHeader) || false)
+		local pLoadID, pLoadRandID, pLoadSize, pLoadFragmentID, svCRC = unpack(pLoadHeader)
+		local onReceive = netPoint._payloads[pLoadID]
+		
+		if (onReceive) then
+			local clCRC = util.CRC(compData)
+
+			netPoint._payloadBuffer[pLoadID][pLoadRandID] = (netPoint._payloadBuffer[pLoadID][pLoadRandID] or {})
+
+			if (svCRC != clCRC) then table.remove(netPoint._payloadBuffer[pLoadID], pLoadRandID) return end
+
+			table.insert(netPoint._payloadBuffer[pLoadID][pLoadRandID], pLoadFragmentID, data)
+
+			if (#netPoint._payloadBuffer[pLoadID][pLoadRandID] == tonumber(pLoadSize)) then
+				local data = rebuildSplitTable(netPoint._payloadBuffer[pLoadID][pLoadRandID])
+
+				onReceive(data, pLoadExtraHeader)
+
+				table.remove(netPoint._payloadBuffer[pLoadID], pLoadRandID)
+			end
 		end
 	end)
 
@@ -314,3 +443,5 @@ if (CLIENT) then
 		openRequest(reqEP, data)	-- Start our request
 	end
 end
+
+hook.Run("netPoint.Loaded", netPoint)
